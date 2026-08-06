@@ -3,14 +3,15 @@
 # Two jobs, and the split between them is the security boundary:
 #
 #   verify   runs on every pull request AND on every push to main. It holds
-#            `contents: read` and nothing else, so it cannot even ask for an
-#            OIDC token, let alone reach AWS.
+#            `contents: read` and `security-events: write` (the latter only to
+#            upload the Trivy SARIF report to this repo's own Security tab —
+#            it cannot reach another repo or AWS with it), so it cannot even
+#            ask for an OIDC token, let alone reach AWS.
 #   publish  runs only on main, only after verify passed, and is the only job
 #            in this repo that requests `id-token: write`.
 #
 # What actually stops a pull request from publishing is not the `if:` below -
-# it is the trust policy on github-actions-sports-store-auth-service-ecr-push, whose sub
-# condition is `repo:pyly-devops/sports-store-auth-service:ref:refs/heads/main`. A PR run's
+# it is the trust policy on github-actions-sports-store-auth-service-ecr-push, whose sub# condition is `repo:pyly-devops/sports-store-auth-service:ref:refs/heads/main`. A PR run's
 # token carries `...:pull_request`, which never matches, so the AssumeRole call
 # fails outright. The `if:` makes that visible in the file; it is not what
 # makes it true.
@@ -35,6 +36,11 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only for uploading the Trivy SARIF report to THIS repo's Security tab.
+      # Grants nothing toward another repo or AWS.
+      security-events: write
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +82,50 @@ jobs:
       # and it needs no database - the module graph imports on its own.
       - name: The image can import its own application
         run: docker run --rm ci:${{ github.sha }} python -c "import main"
+
+      # ---------------------------------------------------------------------
+      # Vulnerability scan (Milestone extension - container security).
+      #
+      # Two passes on the SAME already-built image, not two different scans:
+      #
+      #   1. Report - CRITICAL+HIGH, exit-code 0. Never fails the build. Its
+      #      only job is to populate this repo's Security tab so vulnerable
+      #      packages are visible without reading CI logs.
+      #   2. Gate - CRITICAL only, exit-code 1, ignore-unfixed. This is what
+      #      can actually fail the workflow. HIGH is deliberately excluded
+      #      from the gate: at this project's age, gating on HIGH would fail
+      #      almost every build on base-image noise unrelated to what the
+      #      team controls, burying the signal that matters. ignore-unfixed
+      #      because failing a build over a CRITICAL CVE with no published fix
+      #      yet blocks shipping for a problem nobody can act on today.
+      #
+      # Pinned to a specific release, never @master - same "no latest,
+      # anywhere" rule this project applies to its own image tags.
+      # ---------------------------------------------------------------------
+      - name: Scan image for vulnerabilities (report)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ci:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload scan report to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Fail the build on unfixed CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ci:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
 
   publish:
     needs: verify
@@ -250,11 +300,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh pr view deploy/auth-service --repo pyly-devops/sports-store-deployments >/dev/null 2>&1; then
-            gh pr edit deploy/auth-service --repo pyly-devops/sports-store-deployments \
-              --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
+            gh pr edit deploy/auth-service --repo pyly-devops/sports-store-deployments \              --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
           else
             gh pr create --repo pyly-devops/sports-store-deployments \
               --head deploy/auth-service --base main \
               --title "Bump auth-service to ${TAG}" \
               --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
           fi
+
