@@ -11,7 +11,8 @@
 #            in this repo that requests `id-token: write`.
 #
 # What actually stops a pull request from publishing is not the `if:` below -
-# it is the trust policy on github-actions-sports-store-auth-service-ecr-push, whose sub# condition is `repo:pyly-devops/sports-store-auth-service:ref:refs/heads/main`. A PR run's
+# it is the trust policy on github-actions-sports-store-auth-service-ecr-push, whose sub
+# condition is `repo:pyly-devops/sports-store-auth-service:ref:refs/heads/main`. A PR run's
 # token carries `...:pull_request`, which never matches, so the AssumeRole call
 # fails outright. The `if:` makes that visible in the file; it is not what
 # makes it true.
@@ -239,6 +240,23 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
+      # Set BEFORE the merge below, not just before the commit further down.
+      # A merge that isn't a fast-forward writes a merge commit, and git
+      # refuses to write any commit without an identity. Configuring this
+      # only in `Commit` made every bump fail with
+      #
+      #   fatal: empty ident name (for <runner@...>) not allowed
+      #
+      # whenever the previous bump was still an open PR — which is the normal
+      # state of the stable-branch design below, not an edge case. Invisible
+      # until then because a fast-forward writes no commit and needs no
+      # identity. Broke all six publishing repos on 2026-08-07.
+      - name: Configure the bot's git identity
+        run: |
+          set -euo pipefail
+          git config user.name "cloudcart-deploy-argocd-bot[bot]"
+          git config user.email "cloudcart-deploy-argocd-bot[bot]@users.noreply.github.com"
+
       # A stable branch name, no tag in it: deploy/auth-service means "the
       # pending bump for auth-service", of which there is exactly one. A
       # superseded bump replaces it rather than queuing behind an abandoned
@@ -250,10 +268,19 @@ jobs:
           set -euo pipefail
           if git ls-remote --exit-code --heads origin deploy/auth-service >/dev/null; then
             git checkout -B deploy/auth-service origin/deploy/auth-service
-            git merge --no-edit origin/main || {
-              echo "::error::merge conflict against main — needs a human" >&2
+            # Only call it a conflict once there are actually unmerged paths.
+            # This handler used to report EVERY merge failure as a conflict,
+            # which is precisely what hid the missing-identity fatal above it
+            # and sent a reader hunting for a content conflict that never
+            # existed. git's own message stays in the log either way.
+            if ! git merge --no-edit origin/main; then
+              if [ -n "$(git ls-files --unmerged)" ]; then
+                echo "::error::merge conflict against main on deploy/auth-service — needs a human" >&2
+              else
+                echo "::error::git merge failed for a non-conflict reason — see the git output above" >&2
+              fi
               exit 1
-            }
+            fi
           else
             git checkout -B deploy/auth-service
           fi
@@ -285,8 +312,7 @@ jobs:
             echo "no change — tag already at $TAG"
             exit 0
           fi
-          git config user.name "cloudcart-deploy-argocd-bot[bot]"
-          git config user.email "cloudcart-deploy-argocd-bot[bot]@users.noreply.github.com"
+          # Identity is configured once, before the merge — see the step above.
           git add helm/sports-store/environments/production/images/auth-service.yaml
           git commit -m "Bump auth-service to ${TAG}"
           # A plain push, never --force: main was just merged in above, not
@@ -299,12 +325,20 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          if gh pr view deploy/auth-service --repo pyly-devops/sports-store-deployments >/dev/null 2>&1; then
-            gh pr edit deploy/auth-service --repo pyly-devops/sports-store-deployments \              --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
+          # `gh pr view` finds a PR by head branch regardless of state — a
+          # branch whose only-ever PR already merged still "exists" to a
+          # bare existence check, so this used to edit the OLD merged PR's
+          # body and leave the new commit on the branch with nothing open
+          # to land it. Found live (M8 Tier 4 verification, 2026-08-07):
+          # every service's SECOND deploy ever did this silently. Checking
+          # state explicitly is the fix — anything but OPEN needs a new PR.
+          STATE=$(gh pr view deploy/auth-service --repo pyly-devops/sports-store-deployments --json state --jq .state 2>/dev/null || echo NONE)
+          if [ "$STATE" = "OPEN" ]; then
+            gh pr edit deploy/auth-service --repo pyly-devops/sports-store-deployments \
+              --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
           else
             gh pr create --repo pyly-devops/sports-store-deployments \
               --head deploy/auth-service --base main \
               --title "Bump auth-service to ${TAG}" \
               --body "Bumps \`auth-service\` to \`${TAG}\`. Merging this **is** the deploy — Argo CD picks it up automatically."
           fi
-
