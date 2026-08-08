@@ -3,8 +3,10 @@
 # Two jobs, and the split between them is the security boundary:
 #
 #   verify   runs on every pull request AND on every push to main. It holds
-#            `contents: read` and nothing else, so it cannot even ask for an
-#            OIDC token, let alone reach AWS.
+#            `contents: read` and `security-events: write` (the latter only to
+#            upload the Trivy SARIF report to this repo's own Security tab —
+#            it cannot reach another repo or AWS with it), so it cannot even
+#            ask for an OIDC token, let alone reach AWS.
 #   publish  runs only on main, only after verify passed, and is the only job
 #            in this repo that requests `id-token: write`.
 #
@@ -35,6 +37,11 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only for uploading the Trivy SARIF report to THIS repo's Security tab.
+      # Grants nothing toward another repo or AWS.
+      security-events: write
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +83,50 @@ jobs:
       # and it needs no database - the module graph imports on its own.
       - name: The image can import its own application
         run: docker run --rm ci:${{ github.sha }} python -c "import main"
+
+      # ---------------------------------------------------------------------
+      # Vulnerability scan (Milestone extension - container security).
+      #
+      # Two passes on the SAME already-built image, not two different scans:
+      #
+      #   1. Report - CRITICAL+HIGH, exit-code 0. Never fails the build. Its
+      #      only job is to populate this repo's Security tab so vulnerable
+      #      packages are visible without reading CI logs.
+      #   2. Gate - CRITICAL only, exit-code 1, ignore-unfixed. This is what
+      #      can actually fail the workflow. HIGH is deliberately excluded
+      #      from the gate: at this project's age, gating on HIGH would fail
+      #      almost every build on base-image noise unrelated to what the
+      #      team controls, burying the signal that matters. ignore-unfixed
+      #      because failing a build over a CRITICAL CVE with no published fix
+      #      yet blocks shipping for a problem nobody can act on today.
+      #
+      # Pinned to a specific release, never @master - same "no latest,
+      # anywhere" rule this project applies to its own image tags.
+      # ---------------------------------------------------------------------
+      - name: Scan image for vulnerabilities (report)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ci:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload scan report to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Fail the build on unfixed CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ci:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
 
   publish:
     needs: verify
